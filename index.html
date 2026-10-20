@@ -231,6 +231,7 @@
       { id: 'race_marathon', label: 'Marathon', meters: 42195 }
     ];
 
+    function escapeHTML(value) { return String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
     let activities = [];
     let allTimePRs = {};
 
@@ -449,13 +450,13 @@
       const thresholdPaceSecPerKm = 1000 / thresholdSpeed;
       const thresholdPaceSecPerMile = 1609.34 / thresholdSpeed;
 
-      paceEl.textContent = fmtPace(1000, thresholdPaceSecPerKm);
-      paceMileEl.textContent = fmtPace(1609.34, thresholdPaceSecPerMile);
+      paceEl.textContent = formatPace(1000, thresholdPaceSecPerKm);
+      paceMileEl.textContent = formatTime(thresholdPaceSecPerMile) + ' /mile';
       hrEl.textContent = Math.round(weightedHR) + ' bpm';
 
       const best = top[0].activity;
       sourceEl.textContent = best.title;
-      sourceDetailEl.textContent = `${best.date} • ${(best.totalDistance / 1000).toFixed(2)} km • ${fmtTime(best.totalDuration)}`;
+      sourceDetailEl.textContent = `${best.date} • ${(best.totalDistance / 1000).toFixed(2)} km • ${formatTime(best.totalDuration)}`;
       badge.textContent = `Estimated from ${top.length} qualifying ${top.length === 1 ? 'activity' : 'activities'}`;
     }
 
@@ -521,7 +522,7 @@
         btn.onclick = () => selectActivity(idx);
         btn.innerHTML = `
           <div class="flex justify-between items-center">
-            <span class="font-semibold text-sm text-slate-100 truncate pr-2">${act.title}</span>
+            <span class="font-semibold text-sm text-slate-100 truncate pr-2">${escapeHTML(act.title)}</span>
             <span class="text-xs text-amber-400 font-bold shrink-0">${(act.totalDistance / 1000).toFixed(2)} km</span>
           </div>
           <div class="flex gap-3 text-xs text-slate-400 mt-1.5">
@@ -637,19 +638,6 @@
       };
     }
 
-    document.getElementById('fileInput').addEventListener('change', async (e) => {
-      const files = Array.from(e.target.files);
-      for (const file of files) {
-        const text = await file.text();
-        const activity = parseWorkoutFile(text, file.name);
-        activities.unshift(activity);
-      }
-      activities.sort((a, b) => new Date(b.isoDate) - new Date(a.isoDate));
-      recomputeAllTimePRs();
-      renderActivityList();
-      if (activities.length > 0) selectActivity(0);
-    });
-
     // Help Modal Controls
     document.getElementById('helpBtn').addEventListener('click', () => {
       const modal = document.getElementById('helpModal');
@@ -674,6 +662,155 @@
     renderPRGrid();
     calculateRacePredictions();
     renderWeeklyMileage();
+
+    const storageBar = document.createElement('section');
+    storageBar.className = 'max-w-6xl mx-auto mt-6 p-4 bg-slate-900 border border-slate-700 rounded-xl text-sm';
+    storageBar.innerHTML = '<div class="flex flex-wrap gap-3 items-center"><span id="storageStatus" role="status">Opening saved activities…</span><button id="exportBackup" class="bg-slate-800 px-3 py-2 rounded">Export JSON backup</button><label class="cursor-pointer bg-slate-800 px-3 py-2 rounded">Restore JSON backup<input id="restoreBackup" type="file" accept=".json" hidden></label></div><p class="text-xs text-slate-400 mt-2">Saved on this browser and device, not synced to other devices. Keep a JSON backup.</p>';
+    document.querySelector('header').after(storageBar);
+    const statusEl = document.getElementById('storageStatus');
+    const uploadInput = document.getElementById('fileInput');
+    let database;
+    let storageBusy = false;
+    function status(message, error=false) {
+      statusEl.textContent = message;
+      statusEl.className = error ? 'text-rose-400' : 'text-emerald-300';
+    }
+    function setBusy(value) {
+      storageBusy=value;
+      uploadInput.disabled=value;
+      document.getElementById('restoreBackup').disabled=value;
+      document.getElementById('exportBackup').disabled=value;
+    }
+    function openDatabase() {
+      return new Promise((resolve,reject)=>{
+        const request=indexedDB.open('PaceTrackerActivities',1);
+        request.onupgradeneeded=()=>request.result.createObjectStore('activities',{keyPath:'id'});
+        request.onsuccess=()=>resolve(request.result);
+        request.onerror=()=>reject(request.error);
+        request.onblocked=()=>status('Close other PaceTracker tabs to finish opening storage.',true);
+      });
+    }
+    function readActivities() {
+      return new Promise((resolve,reject)=>{
+        const tx=database.transaction('activities','readonly');
+        const req=tx.objectStore('activities').getAll();
+        let result;
+        req.onsuccess=()=>result=req.result;
+        tx.oncomplete=()=>resolve(result);
+        tx.onerror=tx.onabort=()=>reject(tx.error || new Error('Read failed'));
+      });
+    }
+    function commitActivities(next) {
+      return new Promise((resolve,reject)=>{
+        const tx=database.transaction('activities','readwrite');
+        const store=tx.objectStore('activities');
+        store.clear();
+        next.forEach(a=>store.put(a));
+        tx.oncomplete=resolve;
+        tx.onerror=tx.onabort=()=>reject(tx.error || new Error('Save failed'));
+      });
+    }
+    function refreshSavedDashboard() {
+      activities.sort((a,b)=>new Date(b.isoDate)-new Date(a.isoDate));
+      recomputeAllTimePRs();
+      renderActivityList();
+      if(activities.length) selectActivity(0);
+      else {
+        document.getElementById('detailTitle').textContent='Select an Activity';
+        document.getElementById('detailDate').textContent='Upload or choose a run to inspect metrics';
+        ['statDist','statDuration','statPace','statHR'].forEach((id,i)=>document.getElementById(id).textContent=['-- km','--:--','-- /km','-- bpm'][i]);
+        document.getElementById('activityEffortsTable').innerHTML='<tr><td colspan="4" class="p-4 text-center text-slate-500">No activity selected</td></tr>';
+      }
+      status(`${activities.length} activities saved on this browser.`);
+    }
+    const originalRenderList=renderActivityList;
+    renderActivityList=function(){
+      originalRenderList();
+      const list=document.getElementById('activitiesList');
+      Array.from(list.children).forEach((row,index)=>{
+        if(!activities[index]) return;
+        const wrapper=document.createElement('div');
+        wrapper.className='flex gap-2 items-center';
+        row.replaceWith(wrapper);
+        wrapper.appendChild(row);
+        const remove=document.createElement('button');
+        remove.textContent='×';
+        remove.title='Delete activity';
+        remove.setAttribute('aria-label','Delete '+activities[index].title);
+        remove.className='text-slate-400 hover:text-rose-400 text-2xl px-2';
+        remove.onclick=async()=>{
+          if(storageBusy || !database) return;
+          const activity=activities[index];
+          if(!confirm(`Delete "${activity.title}" from saved activities?`))return;
+          setBusy(true);
+          try {
+            const next=activities.filter(a=>a.id!==activity.id);
+            await commitActivities(next);
+            activities=next;
+            refreshSavedDashboard();
+          } catch(error){status('Deletion failed; activity was kept. '+error.message,true);}
+          finally{setBusy(false);}
+        };
+        wrapper.appendChild(remove);
+      });
+    };
+    uploadInput.addEventListener('change',async event=>{
+      if(storageBusy || !database)return;
+      setBusy(true);
+      try {
+        const incoming=[];
+        for(const file of event.target.files){
+          const text=await file.text();
+          const xml=new DOMParser().parseFromString(text,'text/xml');
+          if(xml.querySelector('parsererror') || !xml.querySelector('Trackpoint, trkpt'))throw new Error('Invalid activity: '+file.name);
+          const activity=parseWorkoutFile(text,file.name);
+          if(!Number.isFinite(activity.totalDistance) || !(activity.totalDuration>0))throw new Error('Invalid distance or duration: '+file.name);
+          incoming.push(activity);
+        }
+        const next=[...activities,...incoming];
+        await commitActivities(next);
+        activities=next;
+        refreshSavedDashboard();
+      }catch(error){status('Import not saved. '+error.message,true);}
+      finally{event.target.value='';setBusy(false);}
+    });
+    document.getElementById('exportBackup').onclick=()=>{
+      const blob=new Blob([JSON.stringify({format:'PaceTrackerBackup',version:1,exportedAt:new Date().toISOString(),activities},null,2)],{type:'application/json'});
+      const url=URL.createObjectURL(blob),a=document.createElement('a');
+      a.href=url;a.download='pace-tracker-backup-'+new Date().toISOString().slice(0,10)+'.json';a.click();
+      setTimeout(()=>URL.revokeObjectURL(url),1000);
+    };
+    document.getElementById('restoreBackup').onchange=async event=>{
+      if(storageBusy || !database || !event.target.files.length)return;
+      setBusy(true);
+      try {
+        const backup=JSON.parse(await event.target.files[0].text());
+        if(backup.format!=='PaceTrackerBackup' || backup.version!==1 || !Array.isArray(backup.activities))throw new Error('Not a supported backup.');
+        const ids=new Set();
+        for(const a of backup.activities){
+          if(!a || typeof a.id!=='string' || ids.has(a.id) || typeof a.title!=='string' || !Number.isFinite(a.totalDistance) || a.totalDistance<0 || !Number.isFinite(a.totalDuration) || a.totalDuration<=0 || !Number.isFinite(Date.parse(a.isoDate)) || !a.bestEfforts)throw new Error('Invalid activity in backup.');
+          for(const b of BENCHMARKS){const e=a.bestEfforts[b.id];if(e && (!Number.isFinite(e.time) || e.time<=0 || typeof e.pace!=='string'))throw new Error('Invalid effort in backup.');}
+          ids.add(a.id);
+        }
+        if(confirm(`Replace your ${activities.length} saved activities with ${backup.activities.length} activities from this backup? Export a backup first if needed.`)){
+          await commitActivities(backup.activities);
+          activities=backup.activities;
+          refreshSavedDashboard();
+        }
+      }catch(error){status('Restore failed; existing activities kept. '+error.message,true);}
+      finally{event.target.value='';setBusy(false);}
+    };
+    (async()=>{
+      setBusy(true);
+      try{
+        database=await openDatabase();
+        database.onversionchange=()=>{database.close();database=null;setBusy(true);status('Storage changed in another tab. Reload this page.',true);};
+        activities=await readActivities();
+        refreshSavedDashboard();
+        setBusy(false);
+      }catch(error){status('Browser storage unavailable. Imports disabled to prevent unsaved data. '+error.message,true);}
+    })();
+
   </script>
 </body>
 </html>
